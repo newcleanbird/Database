@@ -1,4 +1,4 @@
-# 数据库-MySQL
+# 数据库-MySQL八股
 
 >内容参考总结⾃⽹络资料，如⼩林coding、MySQL45讲
 
