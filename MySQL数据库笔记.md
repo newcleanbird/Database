@@ -8449,3 +8449,170 @@ write和fsync的时机，可以由参数`sync_binlog`控制，默认是 `0`。�
 首先我们将多个节点共同组成一个复制组，在`执行读写（RW）事务`的时候，需要通过一致性协议层（Consensus 层）的同意，也就是读写事务想要进行提交，必须要经过组里“大多数人”（对应 Node 节点）的同意，大多数指的是同意的节点数量需要大于 （N/2+1），这样才可以进行提交，而不是原发起方一个说了算。而针对`只读（RO）事务`则不需要经过组内同意，直接 COMMIT 即可。
 
 ![image-20220405165650425](https://cdn.jsdelivr.net/gh/aoshihuankong/cloudimg@master/img/202204051656560.png)
+
+### 第19章 数据库备份与恢复
+
+#### 物理备份与逻辑备份
+
+**物理备份**：备份数据文件，转储数据库物理文件到某一目录。物理备份恢复速度比较快，但占用空间比较大，MySQL中可以用`xtrabackup`工具来进行物理备份。
+
+**逻辑备份**：对数据库对象利用工具进行导出工作，汇总入备份文件内。逻辑备份恢复速度慢，但占用空间小，更灵活。MySQL 中常用的逻辑备份工具为`mysqldump`。逻辑备份就是`备份sql语句`，在恢复的时候执行备份的sql语句实现数据库数据的重现。
+
+#### mysqldump实现逻辑备份
+
+##### 备份一个数据库
+
+```shell
+mysqldump –u 用户名称 –h 主机名称 –p密码 待备份的数据库名称[tbname, [tbname...]]> 备份文件名 称.sql
+```
+
+```shell
+mysqldump -uroot -p atguigu>atguigu.sql #备份文件存储在当前目录下
+mysqldump -uroot -p atguigudb1 > /var/lib/mysql/atguigu.sql
+```
+
+##### 备份全部数据库
+
+```shell
+mysqldump -uroot -pxxxxxx --all-databases > all_database.sql 
+mysqldump -uroot -pxxxxxx -A > all_database.sql
+```
+
+##### 备份部分数据库
+
+```shell
+mysqldump –u user –h host –p --databases [数据库的名称1 [数据库的名称2...]] > 备份文件名 称.sql
+```
+
+```shell
+mysqldump -uroot -p --databases atguigu atguigu12 >two_database.sql
+mysqldump -uroot -p -B atguigu atguigu12 > two_database.sql
+```
+
+##### 备份部分表
+
+```shell
+mysqldump –u user –h host –p 数据库的名称 [表名1 [表名2...]] > 备份文件名称.sql
+```
+
+```shell
+mysqldump -uroot -p atguigu book> book.sql
+#备份多张表 
+mysqldump -uroot -p atguigu book account > 2_tables_bak.sql
+```
+
+##### 备份单表的部分数据
+
+```shell
+mysqldump -uroot -p atguigu student --where="id < 10 " > student_part_id10_low_bak.sql
+```
+
+##### 排除某些表的备份
+
+```shell
+mysqldump -uroot -p atguigu --ignore-table=atguigu.student > no_stu_bak.sql
+```
+
+##### 只备份结构或只备份数据
+
+- 只备份结构
+
+```shell
+mysqldump -uroot -p atguigu --no-data > atguigu_no_data_bak.sql
+```
+
+- 只备份数据
+
+```shell
+mysqldump -uroot -p atguigu --no-create-info > atguigu_no_create_info_bak.sql
+```
+
+##### 备份中包含存储过程、函数、事件
+
+```shell
+mysqldump -uroot -p -R -E --databases atguigu > fun_atguigu_bak.sql
+```
+
+#### mysql命令恢复数据
+
+```shell
+mysql –u root –p [dbname] < backup.sql
+```
+
+##### 单库备份中恢复单库
+
+```shell
+#备份文件中包含了创建数据库的语句
+mysql -uroot -p < atguigu.sql
+#备份文件中不包含了创建数据库的语句
+mysql -uroot -p atguigu4< atguigu.sql
+```
+
+##### 全量备份恢复
+
+```shell
+mysql –u root –p < all.sql
+```
+
+##### 从全量备份中恢复单库
+
+```shell
+sed -n '/^-- Current Database: `atguigu`/,/^-- Current Database: `/p' all_database.sql > atguigu.sql 
+#分离完成后我们再导入atguigu.sql即可恢复单个库
+```
+
+##### 从单库备份中恢复单表
+
+```shell
+cat atguigu.sql | sed -e '/./{H;$!d;}' -e 'x;/CREATE TABLE `class`/!d;q' > class_structure.sql 
+cat atguigu.sql | grep --ignore-case 'insert into `class`' > class_data.sql 
+#用shell语法分离出创建表的语句及插入数据的语句后 再依次导出即可完成恢复 
+
+use atguigu; 
+mysql> source class_structure.sql; 
+Query OK, 0 rows affected, 1 warning (0.00 sec) 
+
+mysql> source class_data.sql; 
+Query OK, 1 row affected (0.01 sec)
+```
+
+#### 表的导出与导入
+
+##### 表的导出
+
+**1.** **使用SELECT…INTO OUTFILE导出文本文件**
+
+```mysql
+SHOW GLOBAL VARIABLES LIKE '%secure%';
+SELECT * FROM account INTO OUTFILE "/var/lib/mysql-files/account.txt";
+```
+
+**2.** **使用mysqldump命令导出文本文件**
+
+```shell
+mysqldump -uroot -p -T "/var/lib/mysql-files/" atguigu account
+# 或
+mysqldump -uroot -p -T "/var/lib/mysql-files/" atguigu account --fields-terminated- by=',' --fields-optionally-enclosed-by='\"'
+```
+
+**3.** **使用mysql命令导出文本文件**
+
+```shell
+mysql -uroot -p --execute="SELECT * FROM account;" atguigu> "/var/lib/mysql-files/account.txt"
+```
+
+##### 表的导入
+
+**1.** **使用LOAD DATA INFILE方式导入文本文件**
+
+```mysql
+LOAD DATA INFILE '/var/lib/mysql-files/account_0.txt' INTO TABLE atguigu.account;
+# 或
+LOAD DATA INFILE '/var/lib/mysql-files/account_1.txt' INTO TABLE atguigu.account FIELDS TERMINATED BY ',' ENCLOSED BY '\"';
+```
+
+**2.** **使用mysqlimport方式导入文本文件**
+
+```shell
+mysqlimport -uroot -p atguigu '/var/lib/mysql-files/account.txt' --fields-terminated- by=',' --fields-optionally-enclosed-by='\"'
+```
