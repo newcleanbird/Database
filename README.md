@@ -1,8 +1,24 @@
 # Database
 
+<div align="center">
+    <a href="https://github.com/newcleanbird/Database/blob/main/LICENSE"> <img src="https://badgen.net/github/license/newcleanbird/Database?icon=github&color=4ab8a1"></a>
+    <a href="https://github.com/newcleanbird/Database/watchers"> <img src="https://badgen.net/github/watchers/newcleanbird/Database?icon=github&color=4ab8a1"></a>
+    <a href="https://github.com/newcleanbird/Database"> <img src="https://badgen.net/github/stars/newcleanbird/Database?icon=github&color=4ab8a1"></a>
+    <a href="https://github.com/newcleanbird/Database/forks"> <img src="https://badgen.net/github/forks//newcleanbird/Database?icon=github&color=4ab8a1"></a>
+</div>
+<br>
+
 ## 简介
 
 本仓库是对数据库的总结，主要以mysql为标准，包含数据库的基本知识点，增删改查，数据库的原理，高级特性，性能优化等。还总结了对应的常见八股问题。
+
+欢迎学习和分享本仓库所有内容，注意请注明出处。
+
+如果你觉得本仓库有用，请点击 `Star`，这对我是极大的鼓励。
+
+如有问题和疑惑，欢迎在`Issues`进行讨论。
+
+如有bug及内容补充，欢迎提交``PR``。
 
 ## 仓库导航
 
@@ -40,7 +56,7 @@
 
 由于在整理过程中可能存在疏忽，未能逐一标注所有引用来源，在此向原作者致以最诚挚的歉意与感谢。如您发现任何内容侵犯了您的版权，请随时通过以下方式联系我：
 
-GitHub Issue: [仓库链接](https://github.com/newcleanbird/) Database/issues
+GitHub Issue: [仓库链接](https://github.com/newcleanbird/Database/issues)
 电子邮箱: [dante.song@foxmail.com](dante.song@foxmail.com)
 
 收到通知后，我将立即采取措施，核实情况并做出相应处理，这可能包括但不限于删除侵权内容、添加适当的引用链接或提供其他形式的补偿。
