@@ -7287,6 +7287,237 @@ SET [GLOBAL|SESSION] TRANSACTION_ISOLATION = '隔离级别'
 > SERIALIZABLE
 ```
 
+### 第14章 MySQL事务日志
+
+事务有4种特性：原子性、一致性、隔离性和持久性。那么事务的四种特性到底是基于什么机制实现呢？
+
+- 事务的隔离性由`锁机制`实现。
+- 而事务的原子性、一致性和持久性由事务的 redo 日志和undo 日志来保证。
+  - REDO LOG 称为`重做日志`，提供再写入操作，恢复提交事务修改的页操作，用来保证事务的持久性。
+  - UNDO LOG 称为`回滚日志`，回滚行记录到某个特定版本，用来保证事务的原子性、一致性。
+
+#### redo日志
+
+##### 为什么需要REDO日志
+
+一方面，缓冲池可以帮助我们消除CPU和磁盘之间的鸿沟，checkpoint机制可以保证数据的最终落盘，然而由于checkpoint`并不是每次变更的时候就触发`的，而是master线程隔一段时间去处理的。所以最坏的情况就是事务提交后，刚写完缓冲池，数据库宕机了，那么这段数据就是丢失的，无法恢复。
+
+另一方面，事务包含`持久性`的特性，就是说对于一个已经提交的事务，在事务提交后即使系统发生了崩溃，这个事务对数据库中所做的更改也不能丢失。
+
+那么如何保证这个持久性呢？`一个简单的做法`：在事务提交完成之前把该事务所修改的所有页面都刷新到磁盘，但是这个简单粗暴的做法有些问题
+
+`另一个解决的思路`：我们只是想让已经提交了的事务对数据库中数据所做的修改永久生效，即使后来系统崩溃，在重启后也能把这种修改恢复出来。所以我们其实没有必要在每次事务提交时就把该事务在内存中修改过的全部页面刷新到磁盘，只需要把`修改`了哪些东西`记录一下`就好。比如，某个事务将系统表空间中`第10号`页面中偏移量为`100`处的那个字节的值`1`改成`2`。我们只需要记录一下：将第0号表空间的10号页面的偏移量为100处的值更新为 2 。
+
+##### REDO日志的好处、特点
+
+**1.** **好处**
+
+- **redo日志降低了刷盘频率**
+- **redo日志占用的空间非常小**
+
+**2.** **特点**
+
+- **redo日志是顺序写入磁盘的**
+- **事务执行过程中，redo log不断记录**
+
+##### redo的组成
+
+Redo log可以简单分为以下两个部分：
+
+- `重做日志的缓冲 (redo log buffer)`，保存在内存中，是易失的。
+
+**参数设置：innodb_log_buffer_size：**
+
+redo log buffer 大小，默认`16M`，最大值是4096M，最小值为1M。
+
+- `重做日志文件 (redo log file)`，保存在硬盘中，是持久的。
+
+##### redo的整体流程
+
+![image-20220403114709581](https://cdn.jsdelivr.net/gh/aoshihuankong/cloudimg@master/img/202204031147714.png)
+
+第1步：先将原始数据从磁盘中读入内存中来，修改数据的内存拷贝
+
+第2步：生成一条重做日志并写入redo log buffer，记录的是数据被修改后的值
+
+第3步：当事务commit时，将redo log buffer中的内容刷新到 redo log file，对 redo log file采用追加写的方式
+
+第4步：定期将内存中修改的数据刷新到磁盘中
+
+> Write-Ahead Log(预先日志持久化)：在持久化一个数据页之前，先将内存中相应的日志页持久化。
+
+##### redo log的刷盘策略
+
+redo log buffer刷盘到redo log file的过程并不是真正的刷到磁盘中去，只是刷入到`文件系统缓存`（page cache）中去（这是现代操作系统为了提高文件写入效率做的一个优化），真正的写入会交给系统自己来决定（比如page cache足够大了）。那么对于InnoDB来说就存在一个问题，如果交给系统来同步，同样如果系统宕机，那么数据也丢失了（虽然整个系统宕机的概率还是比较小的）。
+
+针对这种情况，InnoDB给出`innodb_flush_log_at_trx_commit`参数，该参数控制 commit提交事务时，如何将 redo log buffer 中的日志刷新到 redo log file 中。它支持三种策略：
+
+- `设置为0`：表示每次事务提交时不进行刷盘操作。（系统默认master thread每隔1s进行一次重做日志的同步）
+- `设置为1`：表示每次事务提交时都将进行同步，刷盘操作（`默认值`）
+- `设置为2`：表示每次事务提交时都只把 redo log buffer 内容写入 page cache，不进行同步。由os自己决定什么时候同步到磁盘文件。
+
+##### 不同刷盘策略演示
+
+**1.** **流程图**
+
+![image-20220403115232833](https://cdn.jsdelivr.net/gh/aoshihuankong/cloudimg@master/img/202204031152952.png)
+
+![image-20220403115249492](https://cdn.jsdelivr.net/gh/aoshihuankong/cloudimg@master/img/202204031152607.png)
+
+![image-20220403115300809](https://cdn.jsdelivr.net/gh/aoshihuankong/cloudimg@master/img/202204031153931.png)
+
+##### 写入redo log buffer过程
+
+**1.** **补充概念：Mini-Transaction**
+
+一个事务可以包含若干条语句，每一条语句其实是由若干个`mtr`组成，每一个`mtr`又可以包含若干条redo日志
+
+![image-20220404091224993](https://cdn.jsdelivr.net/gh/aoshihuankong/cloudimg@master/img/202204040912119.png)
+
+**2. redo** **日志写入log buffer**
+
+不同的事务可能是`并发`执行的，所以`事务T1`、`事务T2`之间的`mtr`可能是`交替执行`的。
+
+![image-20220404091511602](https://cdn.jsdelivr.net/gh/aoshihuankong/cloudimg@master/img/202204040915708.png)
+
+##### redo log file
+
+**1.** **相关参数设置**
+
+- `innodb_log_group_home_dir`：指定 redo log 文件组所在的路径，默认值为`./`，表示在数据库的数据目录下。MySQL的默认数据目录（`var/lib/mysql`）下默认有两个名为`ib_logfile0`和`ib_logfile1`的文件，log buffer中的日志默认情况下就是刷新到这两个磁盘文件中。此redo日志文件位置还可以修改。
+- `innodb_log_files_in_group`：指明redo log file的个数，命名方式如：ib_logfile0，ib_logfile1... ib_logfilen。默认2个，最大100个。
+
+- `innodb_flush_log_at_trx_commit`：控制 redo log 刷新到磁盘的策略，默认为`1`。
+- `innodb_log_file_size`：单个 redo log 文件设置大小，默认值为 48M 。最大值为512G，注意最大值指的是整个 redo log 系列文件之和，即（innodb_log_files_in_group * innodb_log_file_size ）不能大于最大值512G。
+
+**2.** **日志文件组**
+
+![image-20220404092038421](https://cdn.jsdelivr.net/gh/aoshihuankong/cloudimg@master/img/202204040920532.png)
+
+**3.** **checkpoint**
+
+![image-20220404092106617](https://cdn.jsdelivr.net/gh/aoshihuankong/cloudimg@master/img/202204040921715.png)
+
+如果 write pos 追上 checkpoint ，表示**日志文件组**满了，这时候不能再写入新的 redo log记录，MySQL 得停下来，清空一些记录，把 checkpoint 推进一下。
+
+#### Undo日志
+
+redo log是事务持久性的保证，undo log是事务原子性的保证。在事务中`更新数据`的`前置操作`其实是要先写入一个 undo log 。
+
+##### 如何理解Undo日志
+
+事务需要保证`原子性`，也就是事务中的操作要么全部完成，要么什么也不做。但有时候事务执行到一半会出现一些情况，比如：
+
+- 情况一：事务执行过程中可能遇到各种错误，比如`服务器本身的错误`，`操作系统错误`，甚至是突然`断电`导致的错误。
+- 情况二：程序员可以在事务执行过程中手动输入`ROLLBACK`语句结束当前事务的执行。
+
+以上情况出现，我们需要把数据改回原先的样子，这个过程称之为`回滚`，这样就可以造成一个假象：这个事务看起来什么都没做，所以符合`原子性`要求。
+
+##### Undo日志的作用
+
+- **作用1：回滚数据**
+- **作用2：MVCC（详情看第16章）**
+
+##### undo的存储结构
+
+**1.** **回滚段与undo页**
+
+InnoDB对undo log的管理采用段的方式，也就是`回滚段（rollback segment）`。每个回滚段记录了`1024`个`undo log segment`，而在每个undo log segment段中进行`undo页`的申请。
+
+**2.** **回滚段与事务**
+
+1. 每个事务只会使用一个回滚段，一个回滚段在同一时刻可能会服务于多个事务。
+
+2. 当一个事务开始的时候，会制定一个回滚段，在事务进行的过程中，当数据被修改时，原始的数据会被复制到回滚段。
+
+3. 在回滚段中，事务会不断填充盘区，直到事务结束或所有的空间被用完。如果当前的盘区不够用，事务会在段中请求扩展下一个盘区，如果所有已分配的盘区都被用完，事务会覆盖最初的盘区或者在回滚段允许的情况下扩展新的盘区来使用。
+
+4. 回滚段存在于undo表空间中，在数据库中可以存在多个undo表空间，但同一时刻只能使用一个undo表空间。
+
+5. 当事务提交时，InnoDB存储引擎会做以下两件事情：
+   - 将undo log放入列表中，以供之后的purge操作
+   - 判断undo log所在的页是否可以重用，若可以分配给下个事务使用
+
+**3.** **回滚段中的数据分类**
+
+1. 未提交的回滚数据(uncommitted undo information)
+
+2. 已经提交但未过期的回滚数据(committed undo information)
+
+3. 事务已经提交并过期的数据(expired undo information)
+
+##### undo的类型
+
+在InnoDB存储引擎中，undo log分为：
+
+- insert undo log
+- update undo log
+
+##### undo log的生命周期
+
+**1.** **简要生成过程**
+
+**只有Buffer Pool的流程：**
+
+![image-20220404093706650](https://cdn.jsdelivr.net/gh/aoshihuankong/cloudimg@master/img/202204040937761.png)
+
+**有了Redo Log和Undo Log之后：**
+
+![image-20220404093832512](https://cdn.jsdelivr.net/gh/aoshihuankong/cloudimg@master/img/202204040938657.png)
+
+**2.** **详细生成过程**
+
+![image-20220404093950136](https://cdn.jsdelivr.net/gh/aoshihuankong/cloudimg@master/img/202204040939231.png)
+
+**当我们执行INSERT时：**
+
+```mysql
+begin; 
+INSERT INTO user (name) VALUES ("tom");
+```
+
+![image-20220404094033441](https://cdn.jsdelivr.net/gh/aoshihuankong/cloudimg@master/img/202204040940543.png)
+
+**当我们执行UPDATE时：**
+
+![image-20220404094105525](https://cdn.jsdelivr.net/gh/aoshihuankong/cloudimg@master/img/202204040941624.png)
+
+```mysql
+UPDATE user SET id=2 WHERE id=1;
+```
+
+![image-20220404094142337](https://cdn.jsdelivr.net/gh/aoshihuankong/cloudimg@master/img/202204040941449.png)
+
+**3.** **undo log是如何回滚的**
+
+以上面的例子来说，假设执行rollback，那么对应的流程应该是这样：
+
+1. 通过undo no=3的日志把id=2的数据删除
+
+2. 通过undo no=2的日志把id=1的数据的deletemark还原成0
+
+3. 通过undo no=1的日志把id=1的数据的name还原成Tom
+
+4. 通过undo no=0的日志把id=1的数据删除
+
+**4.** **undo log的删除**
+
+- 针对于insert undo log
+
+因为insert操作的记录，只对事务本身可见，对其他事务不可见。故该undo log可以在事务提交后直接删除，不需要进行purge操作。
+
+- 针对于update undo log
+
+该undo log可能需要提供MVCC机制，因此不能在事务提交时就进行删除。提交时放入undo log链表，等待purge线程进行最后的删除。
+
+##### Undo日志小结
+
+![image-20220404094436830](https://cdn.jsdelivr.net/gh/aoshihuankong/cloudimg@master/img/202204040944948.png)
+
+undo log是逻辑日志，对事务回滚时，只是将数据库逻辑地恢复到原来的样子。
+
+redo log是物理日志，记录的是数据页的物理变化，undo log不是redo log的逆过程。
+
 ### 第15章 锁
 
 #### 锁概述
@@ -7677,3 +7908,430 @@ MySQL把事务和锁的信息记录在了`information_schema`库中，涉及到�
 MySQL8.0删除了information_schema.INNODB_LOCKS，添加了`performance_schema.data_locks`，可以通过performance_schema.data_locks查看事务的锁情况，和MySQL5.7及之前不同，performance_schema.data_locks不但可以看到阻塞该事务的锁，还可以看到该事务所持有的锁。
 
 同时，information_schema.INNODB_LOCK_WAITS也被`performance_schema.data_lock_waits`所代替。
+
+### 第16章 多版本并发控制
+
+#### 什么是MVCC
+
+MVCC （Multiversion Concurrency Control），多版本并发控制。顾名思义，MVCC 是通过数据行的多个版本管理来实现数据库的`并发控制`。这项技术使得在InnoDB的事务隔离级别下执行`一致性读`操作有了保证。换言之，就是为了查询一些正在被另一个事务更新的行，并且可以看到它们被更新之前的值，这样在做查询的时候就不用等待另一个事务释放锁。
+
+#### 快照读与当前读
+
+MVCC在MySQL InnoDB中的实现主要是为了提高数据库并发性能，用更好的方式去处理`读-写冲突`，做到即使有读写冲突时，也能做到`不加锁`，`非阻塞并发读`，而这个读指的就是`快照读`, 而非`当前读`。当前读实际上是一种加锁的操作，是悲观锁的实现。而MVCC本质是采用乐观锁思想的一种方式。
+
+##### 快照读
+
+快照读又叫一致性读，读取的是快照数据。**不加锁的简单的** **SELECT** **都属于快照读**，即不加锁的非阻塞读。
+
+之所以出现快照读的情况，是基于提高并发性能的考虑，快照读的实现是基于MVCC，它在很多情况下，避免了加锁操作，降低了开销。
+
+既然是基于多版本，那么快照读可能读到的并不一定是数据的最新版本，而有可能是之前的历史版本。
+
+快照读的前提是隔离级别不是串行级别，串行级别下的快照读会退化成当前读。
+
+##### 当前读
+
+当前读读取的是记录的最新版本（最新数据，而不是历史版本的数据），读取时还要保证其他并发事务不能修改当前记录，会对读取的记录进行加锁。加锁的 SELECT，或者对数据进行增删改都会进行当前读。
+
+#### MVCC相关知识点复习
+
+##### 再谈隔离级别
+
+我们知道事务有 4 个隔离级别，可能存在三种并发问题：
+
+![image-20220405153617536](https://cdn.jsdelivr.net/gh/aoshihuankong/cloudimg@master/img/202204051536648.png)
+
+另图：
+
+![image-20220405153632021](https://cdn.jsdelivr.net/gh/aoshihuankong/cloudimg@master/img/202204051536125.png)
+
+##### 隐藏字段、Undo Log版本链
+
+回顾一下undo日志的版本链，对于使用`InnoDB`存储引擎的表来说，它的聚簇索引记录中都包含两个必要的隐藏列。
+
+- `trx_id`：每次一个事务对某条聚簇索引记录进行改动时，都会把该事务的`事务id`赋值给trx_id 隐藏列。
+- `roll_pointer`：每次对某条聚簇索引记录进行改动时，都会把旧的版本写入到 undo日志 中，然后这个隐藏列就相当于一个指针，可以通过它来找到该记录修改前的信息。
+
+#### MVCC实现原理之ReadView
+
+MVCC 的实现依赖于：**隐藏字段、Undo Log、Read View**。
+
+##### 什么是ReadView
+
+ReadView就是事务在使用MVCC机制进行快照读操作时产生的读视图。当事务启动时，会生成数据库系统当前的一个快照，InnoDB为每个事务构造了一个数组，用来记录并维护系统当前`活跃事务`的ID（“活跃”指的就是，启动了但还没提交）。
+
+##### 设计思路
+
+使用`READ UNCOMMITTED`隔离级别的事务，由于可以读到未提交事务修改过的记录，所以直接读取记录的最新版本就好了。
+
+使用`SERIALIZABLE`隔离级别的事务，InnoDB规定使用加锁的方式来访问记录。
+
+使用`READ COMMITTED`和`REPEATABLE READ`隔离级别的事务，都必须保证读到`已经提交了的`事务修改过的记录。假如另一个事务已经修改了记录但是尚未提交，是不能直接读取最新版本的记录的，核心问题就是需要判断一下版本链中的哪个版本是当前事务可见的，这是ReadView要解决的主要问题。
+
+这个ReadView中主要包含4个比较重要的内容，分别如下：
+
+1. `creator_trx_id`，创建这个 Read View 的事务 ID。
+
+    > 说明：只有在对表中的记录做改动时（执行INSERT、DELETE、UPDATE这些语句时）才会为事务分配事务id，否则在一个只读事务中的事务id值都默认为0。
+
+2. `trx_ids`，表示在生成ReadView时当前系统中活跃的读写事务的`事务id列表`。
+
+3. `up_limit_id`，活跃的事务中最小的事务 ID。
+
+4. `low_limit_id`，表示生成ReadView时系统中应该分配给下一个事务的`id`值。low_limit_id 是系统最大的事务id值，这里要注意是系统中的事务id，需要区别于正在活跃的事务ID。
+
+> 注意：low_limit_id并不是trx_ids中的最大值，事务id是递增分配的。比如，现在有id为1， 2，3这三个事务，之后id为3的事务提交了。那么一个新的读事务在生成ReadView时，trx_ids就包括1和2，up_limit_id的值就是1，low_limit_id的值就是4。
+
+##### ReadView的规则
+
+有了这个ReadView，这样在访问某条记录时，只需要按照下边的步骤判断记录的某个版本是否可见。
+
+- 如果被访问版本的trx_id属性值与ReadView中的`creator_trx_id`值相同，意味着当前事务在访问它自己修改过的记录，所以该版本可以被当前事务访问。
+- 如果被访问版本的trx_id属性值小于ReadView中的`up_limit_id`值，表明生成该版本的事务在当前事务生成ReadView前已经提交，所以该版本可以被当前事务访问。
+- 如果被访问版本的trx_id属性值大于或等于ReadView中的`low_limit_id`值，表明生成该版本的事务在当前事务生成ReadView后才开启，所以该版本不可以被当前事务访问。
+- 如果被访问版本的trx_id属性值在ReadView的`up_limit_id`和`low_limit_id`之间，那就需要判断一下trx_id属性值是不是在 trx_ids 列表中。
+  - 如果在，说明创建ReadView时生成该版本的事务还是活跃的，该版本不可以被访问。
+  - 如果不在，说明创建ReadView时生成该版本的事务已经被提交，该版本可以被访问。
+
+##### MVCC整体操作流程
+
+了解了这些概念之后，我们来看下当查询一条记录的时候，系统如何通过MVCC找到它：
+
+1. 首先获取事务自己的版本号，也就是事务 ID；
+
+2. 获取 ReadView；
+
+3. 查询得到的数据，然后与 ReadView 中的事务版本号进行比较；
+
+4. 如果不符合 ReadView 规则，就需要从 Undo Log 中获取历史快照；
+
+5. 最后返回符合规则的数据。
+
+在隔离级别为读已提交（Read Committed）时，一个事务中的每一次 SELECT 查询都会重新获取一次Read View。
+
+如表所示：
+
+![image-20220405154948505](https://cdn.jsdelivr.net/gh/aoshihuankong/cloudimg@master/img/202204051549618.png)
+
+> 注意，此时同样的查询语句都会重新获取一次 Read View，这时如果 Read View 不同，就可能产生不可重复读或者幻读的情况。
+
+当隔离级别为可重复读的时候，就避免了不可重复读，这是因为一个事务只在第一次 SELECT 的时候会获取一次 Read View，而后面所有的 SELECT 都会复用这个 Read View，如下表所示：
+
+![image-20220405155041964](https://cdn.jsdelivr.net/gh/aoshihuankong/cloudimg@master/img/202204051550072.png)
+
+#### MVCC举例说明
+
+##### READ COMMITTED隔离级别下
+
+**READ COMMITTED** **：每次读取数据前都生成一个ReadView**。
+
+##### REPEATABLE READ隔离级别下
+
+使用`REPEATABLE READ`隔离级别的事务来说，只会在第一次执行查询语句时生成一个 ReadView ，之后的查询就不会重复生成了。
+
+##### 如何解决幻读
+
+假设现在表 student 中只有一条数据，数据内容中，主键 id=1，隐藏的 trx_id=10，它的 undo log 如下图所示。
+
+![image-20220405155640520](https://cdn.jsdelivr.net/gh/aoshihuankong/cloudimg@master/img/202204051556631.png)
+
+假设现在有事务 A 和事务 B 并发执行，`事务 A`的事务 id 为`20`，`事务 B`的事务 id 为`30`。
+
+步骤1：事务 A 开始第一次查询数据，查询的 SQL 语句如下。
+
+```mysql
+select * from student where id >= 1;
+```
+
+在开始查询之前，MySQL 会为事务 A 产生一个 ReadView，此时 ReadView 的内容如下：`trx_ids= [20,30]`，`up_limit_id=20`，`low_limit_id=31`，`creator_trx_id=20`。
+
+由于此时表 student 中只有一条数据，且符合 where id>=1 条件，因此会查询出来。然后根据 ReadView机制，发现该行数据的trx_id=10，小于事务 A 的 ReadView 里 up_limit_id，这表示这条数据是事务 A 开启之前，其他事务就已经提交了的数据，因此事务 A 可以读取到。
+
+结论：事务 A 的第一次查询，能读取到一条数据，id=1。
+
+步骤2：接着事务 B(trx_id=30)，往表 student 中新插入两条数据，并提交事务。
+
+```mysql
+insert into student(id,name) values(2,'李四'); 
+insert into student(id,name) values(3,'王五');
+```
+
+此时表student 中就有三条数据了，对应的 undo 如下图所示：
+
+![image-20220405155909223](https://cdn.jsdelivr.net/gh/aoshihuankong/cloudimg@master/img/202204051559345.png)
+
+步骤3：接着事务 A 开启第二次查询，根据可重复读隔离级别的规则，此时事务 A 并不会再重新生成ReadView。此时表 student 中的 3 条数据都满足 where id>=1 的条件，因此会先查出来。然后根据ReadView 机制，判断每条数据是不是都可以被事务 A 看到。
+
+1）首先 id=1 的这条数据，前面已经说过了，可以被事务 A 看到。
+
+2）然后是 id=2 的数据，它的 trx_id=30，此时事务 A 发现，这个值处于 up_limit_id 和 low_limit_id 之间，因此还需要再判断 30 是否处于 trx_ids 数组内。由于事务 A 的 trx_ids=[20,30]，因此在数组内，这表示 id=2 的这条数据是与事务 A 在同一时刻启动的其他事务提交的，所以这条数据不能让事务 A 看到。
+
+3）同理，id=3 的这条数据，trx_id 也为 30，因此也不能被事务 A 看见。
+
+![image-20220405155941753](https://cdn.jsdelivr.net/gh/aoshihuankong/cloudimg@master/img/202204051559867.png)
+
+结论：最终事务 A 的第二次查询，只能查询出 id=1 的这条数据。这和事务 A 的第一次查询的结果是一样的，因此没有出现幻读现象，所以说在 MySQL 的可重复读隔离级别下，不存在幻读问题。
+
+#### MVCC总结
+
+这里介绍了`MVCC`在`READ COMMITTD`、`REPEATABLE READ`这两种隔离级别的事务在执行快照读操作时访问记录的版本链的过程。这样使不同事务的`读-写`、`写-读`操作并发执行，从而提升系统性能。
+
+核心点在于 ReadView 的原理，`READ COMMITTD`、`REPEATABLE READ`这两个隔离级别的一个很大不同就是生成ReadView的时机不同：
+
+- `READ COMMITTD`在每一次进行普通SELECT操作前都会生成一个ReadView
+- `REPEATABLE READ`只在第一次进行普通SELECT操作前生成一个ReadView，之后的查询操作都重复使用这个ReadView就好了。
+
+### 第17章 其它数据库日志
+
+#### MySQL支持的日志
+
+##### 日志类型
+
+MySQL有不同类型的日志文件，用来存储不同类型的日志，分为`二进制日志`、`错误日志`、`通用查询日志`和`慢查询日志`，这也是常用的4种。MySQL 8又新增两种支持的日志：`中继日志`和`数据定义语句日志`。使用这些日志文件，可以查看MySQL内部发生的事情。
+
+- **慢查询日志：**记录所有执行时间超过long_query_time的所有查询，方便我们对查询进行优化。
+
+- **通用查询日志：**记录所有连接的起始时间和终止时间，以及连接发送给数据库服务器的所有指令，对我们复原操作的实际场景、发现问题，甚至是对数据库操作的审计都有很大的帮助。
+
+- **错误日志：**记录MySQL服务的启动、运行或停止MySQL服务时出现的问题，方便我们了解服务器的状态，从而对服务器进行维护。
+
+- **二进制日志：**记录所有更改数据的语句，可以用于主从服务器之间的数据同步，以及服务器遇到故障时数据的无损失恢复。
+
+- **中继日志：**用于主从服务器架构中，从服务器用来存放主服务器二进制日志内容的一个中间文件。从服务器通过读取中继日志的内容，来同步主服务器上的操作。
+
+- **数据定义语句日志：**记录数据定义语句执行的元数据操作。
+
+除二进制日志外，其他日志都是`文本文件`。默认情况下，所有日志创建于`MySQL数据目录`中。
+
+##### 日志的弊端
+
+- 日志功能会`降低MySQL数据库的性能`。
+
+- 日志会`占用大量的磁盘空间`。
+
+#### 通用查询日志(general query log)
+
+通用查询日志用来`记录用户的所有操作`，包括启动和关闭MySQL服务、所有用户的连接开始时间和截止时间、发给 MySQL 数据库服务器的所有 SQL 指令等。当我们的数据发生异常时，**查看通用查询日志，还原操作时的具体场景**，可以帮助我们准确定位问题。
+
+##### 查看当前状态
+
+```mysql
+mysql> SHOW VARIABLES LIKE '%general%';
+```
+
+##### 启动日志
+
+**方式1：** **永久性方式**
+
+```ini
+[mysqld] 
+general_log=ON 
+general_log_file=[path[filename]] #日志文件所在目录路径，filename为日志文件名
+```
+
+**方式2：** **临时性方式**
+
+```mysql
+SET GLOBAL general_log=on; # 开启通用查询日志
+SET GLOBAL general_log_file=’path/filename’; # 设置日志文件保存位置
+SET GLOBAL general_log=off; # 关闭通用查询日志
+SHOW VARIABLES LIKE 'general_log%'; # 查看设置后情况
+```
+
+##### 停止日志
+
+**方式1：** **永久性方式**
+
+```ini
+[mysqld] 
+general_log=OFF
+```
+
+**方式2：** **临时性方式**
+
+```mysql
+SET GLOBAL general_log=off;
+SHOW VARIABLES LIKE 'general_log%';
+```
+
+#### 错误日志(error log)
+
+##### 启动日志命令
+
+在MySQL数据库中，错误日志功能是`默认开启`的。而且，错误日志`无法被禁止`。
+
+```ini
+[mysqld] 
+log-error=[path/[filename]] #path为日志文件所在的目录路径，filename为日志文件名
+```
+
+##### 查看日志命令
+
+```mysql
+mysql> SHOW VARIABLES LIKE 'log_err%';
+```
+
+##### 删除\刷新日志命令
+
+```shell
+install -omysql -gmysql -m0644 /dev/null /var/log/mysqld.log
+mysqladmin -uroot -p flush-logs
+```
+
+#### 二进制日志(bin log)
+
+##### 查看默认情况
+
+```mysql
+mysql> show variables like '%log_bin%';
+```
+
+##### 日志参数设置
+
+**方式1：** **永久性方式**
+
+```ini
+[mysqld] 
+#启用二进制日志 
+log-bin=atguigu-bin 
+binlog_expire_logs_seconds=600 max_binlog_size=100M
+```
+
+**设置带文件夹的bin-log日志存放目录：**
+
+```ini
+[mysqld] 
+log-bin="/var/lib/mysql/binlog/atguigu-bin"
+```
+
+注意：新建的文件夹需要使用mysql用户，使用下面的命令即可。
+
+```shell
+chown -R -v mysql:mysql binlog
+```
+
+**方式2：** **临时性方式**
+
+```mysql
+# global 级别 
+mysql> set global sql_log_bin=0; 
+ERROR 1228 (HY000): Variable 'sql_log_bin' is a SESSION variable and can`t be used with SET GLOBAL 
+
+# session级别 
+mysql> SET sql_log_bin=0; 
+Query OK, 0 rows affected (0.01 秒)
+```
+
+##### 查看日志
+
+```mysql
+mysqlbinlog -v "/var/lib/mysql/binlog/atguigu-bin.000002"
+# 不显示binlog格式的语句
+mysqlbinlog -v --base64-output=DECODE-ROWS "/var/lib/mysql/binlog/atguigu-bin.000002"
+```
+
+```mysql
+# 可查看参数帮助 
+mysqlbinlog --no-defaults --help 
+
+# 查看最后100行 
+mysqlbinlog --no-defaults --base64-output=decode-rows -vv atguigu-bin.000002 |tail -100 
+
+# 根据position查找 
+mysqlbinlog --no-defaults --base64-output=decode-rows -vv atguigu-bin.000002 |grep -A20 '4939002'
+```
+
+上面这种办法读取出binlog日志的全文内容比较多，不容易分辨查看到pos点信息，下面介绍一种更为方便的查询命令：
+
+```mysql
+mysql> show binlog events [IN 'log_name'] [FROM pos] [LIMIT [offset,] row_count];
+```
+
+- `IN 'log_name'`：指定要查询的binlog文件名（不指定就是第一个binlog文件）
+- `FROM pos`：指定从哪个pos起始点开始查起（不指定就是从整个文件首个pos点开始算）
+- `LIMIT [offset]`：偏移量(不指定就是0)
+- `row_count`:查询总条数（不指定就是所有行）
+
+```mysql
+mysql> show binlog events in 'atguigu-bin.000002';
+```
+
+##### 使用日志恢复数据
+
+mysqlbinlog恢复数据的语法如下：
+
+```shell
+mysqlbinlog [option] filename|mysql –uuser -ppass;
+```
+
+- `filename`：是日志文件名。
+- `option`：可选项，比较重要的两对option参数是--start-date、--stop-date 和 --start-position、-- stop-position。
+  - `--start-date 和 --stop-date`：可以指定恢复数据库的起始时间点和结束时间点。
+  - `--start-position和--stop-position`：可以指定恢复数据的开始位置和结束位置。
+
+> 注意：使用mysqlbinlog命令进行恢复操作时，必须是编号小的先恢复，例如atguigu-bin.000001必须在atguigu-bin.000002之前恢复。
+
+##### 删除二进制日志
+
+**1. PURGE MASTER LOGS：** **删除指定日志文件**
+
+```mysql
+PURGE {MASTER | BINARY} LOGS TO ‘指定日志文件名’ 
+PURGE {MASTER | BINARY} LOGS BEFORE ‘指定日期’
+```
+
+#### 再谈二进制日志(binlog)
+
+##### 写入机制
+
+binlog的写入时机也非常简单，事务执行过程中，先把日志写到`binlog cache`，事务提交的时候，再把binlog cache写到binlog文件中。因为一个事务的binlog不能被拆开，无论这个事务多大，也要确保一次性写入，所以系统会给每个线程分配一个块内存作为binlog cache。
+
+![image-20220405163025361](https://cdn.jsdelivr.net/gh/aoshihuankong/cloudimg@master/img/202204051630535.png)
+
+write和fsync的时机，可以由参数`sync_binlog`控制，默认是 `0`。为0的时候，表示每次提交事务都只write，由系统自行判断什么时候执行fsync。虽然性能得到提升，但是机器宕机，page cache里面的binglog 会丢失。如下图：
+
+![image-20220405163125180](https://cdn.jsdelivr.net/gh/aoshihuankong/cloudimg@master/img/202204051631346.png)
+
+为了安全起见，可以设置为`1`，表示每次提交事务都会执行fsync，就如同**redo log** **刷盘流程**一样。最后还有一种折中方式，可以设置为N(N>1)，表示每次提交事务都write，但累积N个事务后才fsync。
+
+![image-20220405163205364](https://cdn.jsdelivr.net/gh/aoshihuankong/cloudimg@master/img/202204051632526.png)
+
+在出现IO瓶颈的场景里，将sync_binlog设置成一个比较大的值，可以提升性能。同样的，如果机器宕机，会丢失最近N个事务的binlog日志。
+
+##### binlog与redolog对比
+
+- redo log 它是`物理日志`，记录内容是“在某个数据页上做了什么修改”，属于 InnoDB 存储引擎层产生的。
+- 而 binlog 是`逻辑日志`，记录内容是语句的原始逻辑，类似于“给 ID=2 这一行的 c 字段加 1”，属于MySQL Server 层。
+- 虽然它们都属于持久化的保证，但是侧重点不同。
+  - redo log 让InnoDB存储引擎拥有了崩溃恢复能力。
+  - binlog保证了MySQL集群架构的数据一致性
+
+##### 两阶段提交
+
+在执行更新语句过程，会记录redo log与binlog两块日志，以基本的事务为单位，redo log在事务执行过程中可以不断写入，而binlog只有在提交事务时才写入，所以redo log与binlog的`写入时机`不一样。
+
+为了解决两份日志之间的逻辑一致问题，InnoDB存储引擎使用**两阶段提交**方案。
+
+![image-20220405163716222](https://cdn.jsdelivr.net/gh/aoshihuankong/cloudimg@master/img/202204051637390.png)
+
+使用**两阶段提交**后，写入binlog时发生异常也不会有影响
+
+![image-20220405163902977](https://cdn.jsdelivr.net/gh/aoshihuankong/cloudimg@master/img/202204051639192.png)
+
+另一个场景，redo log设置commit阶段发生异常，那会不会回滚事务呢？
+
+![image-20220405163927129](https://cdn.jsdelivr.net/gh/aoshihuankong/cloudimg@master/img/202204051639403.png)
+
+并不会回滚事务，它会执行上图框住的逻辑，虽然redo log是处于prepare阶段，但是能通过事务id找到对应的binlog日志，所以MySQL认为是完整的，就会提交事务恢复数据。
+
+#### 中继日志(relay log)
+
+##### 中继日志介绍
+
+**中继日志只在主从服务器架构的从服务器上存在**。从服务器为了与主服务器保持一致，要从主服务器读取二进制日志的内容，并且把读取到的信息写入`本地的日志文件`中，这个从服务器本地的日志文件就叫`中继日志`。然后，从服务器读取中继日志，并根据中继日志的内容对从服务器的数据进行更新，完成主从服务器的`数据同步`。
+
+##### 恢复的典型错误
+
+如果从服务器宕机，有的时候为了系统恢复，要重装操作系统，这样就可能会导致你的`服务器名称`与之前`不同`。而中继日志里是`包含从服务器名`的。在这种情况下，就可能导致你恢复从服务器的时候，无法从宕机前的中继日志里读取数据，以为是日志文件损坏了，其实是名称不对了。
+
+解决的方法也很简单，把从服务器的名称改回之前的名称。
